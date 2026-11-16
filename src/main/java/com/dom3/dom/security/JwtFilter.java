@@ -46,12 +46,25 @@ public class JwtFilter extends OncePerRequestFilter {
                 Integer idUsuario = claims.get("id_usuario", Integer.class);
                 String userId = String.valueOf(idUsuario);
 
-                // 2. Extraemos la LISTA de roles ("roles") y tomamos el primero
+                // 2. Extraemos TODOS los roles de la lista ("roles") y normalizamos el prefijo ROLE_
                 List<String> rolesList = claims.get("roles", List.class);
-                String rol = (rolesList != null && !rolesList.isEmpty()) ? rolesList.get(0) : "ROLE_USER";
+                List<SimpleGrantedAuthority> authorities;
+
+                if (rolesList != null && !rolesList.isEmpty()) {
+                    authorities = rolesList.stream()
+                            .map(String::toUpperCase)
+                            .map(r -> r.startsWith("ROLE_") ? r : "ROLE_" + r)
+                            .map(SimpleGrantedAuthority::new)
+                            .toList();
+                } else {
+                    authorities = Collections.singletonList(new SimpleGrantedAuthority("ROLE_USER"));
+                }
+
+                // Log temporal para confirmar en consola qué ID y qué roles leyó del token:
+                System.out.println("✅ JWT Válido -> userId: " + userId + " | Authorities: " + authorities);
 
                 UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
-                        userId, null, Collections.singletonList(new SimpleGrantedAuthority(rol))
+                        userId, null, authorities
                 );
 
                 SecurityContextHolder.getContext().setAuthentication(auth);

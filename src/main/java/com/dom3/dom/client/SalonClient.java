@@ -4,12 +4,35 @@ import com.dom3.dom.dto.SalonDetalleDTO;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 
-// ¡AQUÍ VA LA IP DE ZEROTIER DE TU COMPAÑERO!
-@FeignClient(name = "dominio-salones", url = "http://192.168.192.10:8082") 
+import java.util.Map;
+
+@FeignClient(name = "dominio-salones", url = "${dominio2.url:http://172.30.120.90:8081}")
 public interface SalonClient {
-    
-    // Cambia "/api/salones/{id}" por la URL exacta que tenga tu compañero en el Dom 2
-    @GetMapping("/api/salones/{id}/detalle") 
+
+    @GetMapping("/api/v1/salones/{id}/detalle")
     SalonDetalleDTO obtenerDetalleSalon(@PathVariable("id") Integer id);
+
+    @GetMapping("/api/v1/salones/{id}/detalle")
+    Object obtenerSalonDetalleCrudo(@PathVariable("id") Integer id);
+
+    @GetMapping("/api/v1/salones/{id}")
+    Object obtenerSalonPorIdCrudo(@PathVariable("id") Integer id);
+
+    @GetMapping("/api/v1/salones/propietario")
+    Object obtenerSalonesPropietario();
+
+    @GetMapping("/api/v1/servicios")
+    Object obtenerCatalogoServicios();
+
+    @GetMapping("/api/v1/salones/{id}/inventario")
+    Object obtenerInventarioSalon(@PathVariable("id") Integer id);
+
+    @GetMapping("/api/v1/salones/{id}/categorias")
+    Object obtenerCategoriasSalon(@PathVariable("id") Integer id);
+
+    @PostMapping("/api/v1/salones/{id}/disponibilidad")
+    void bloquearFechaEnCalendario(@PathVariable("id") Integer id, @RequestBody Map<String, Object> bloqueoPayload);
 }
