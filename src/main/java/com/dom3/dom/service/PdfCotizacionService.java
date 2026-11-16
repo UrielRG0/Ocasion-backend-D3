@@ -138,6 +138,7 @@ public class PdfCotizacionService {
             // 2. SERVICIOS CONTRATADOS (Nombre y Cantidad + Precios)
             document.add(new Paragraph("Servicios Contratados", subtituloFont));
             document.add(new Paragraph(" "));
+            
             PdfPTable tablaServicios = new PdfPTable(new float[]{4.8f, 1.4f, 1.9f, 1.9f});
             tablaServicios.setWidthPercentage(100);
             agregarEncabezado(tablaServicios, "Nombre del Servicio", boldFont);
