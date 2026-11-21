@@ -7,4 +7,6 @@ import lombok.Data;
 public class ServicioSolicitadoDTO {
     @NotNull
     private Integer idServicio;
+    private Integer cantidad;
+    private String nombreDelServicio;
 }

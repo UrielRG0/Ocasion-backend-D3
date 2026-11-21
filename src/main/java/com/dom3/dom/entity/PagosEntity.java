@@ -1,16 +1,21 @@
 package com.dom3.dom.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
 
 @Entity
 @Table(name = "Pagos")
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class PagosEntity {
 
     @Id
@@ -19,13 +24,18 @@ public class PagosEntity {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "Reservacionid_reservacion")
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     private ReservacionEntity reservacion;
 
     private BigDecimal monto;
+
     private LocalDate fecha_pago;
-    private String tipo_pago;
-    private String estadoPago;
-    private String metodo_pago;
-    private String id_transaccion_pasarela;
+
+    private String tipo_pago; // 'ANTICIPO', 'ABONO', 'LIQUIDACION'
+
+    private String estadoPago; // 'COMPLETADO', 'RECHAZADO'
+
+    private String metodo_pago; // 'PAYPAL', 'STRIPE'
+
+    private String id_transaccion_pasarela; // ID de captura devuelto por PayPal
 }

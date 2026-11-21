@@ -15,14 +15,20 @@ public interface SalonClient {
     @GetMapping("/api/v1/salones/{id}/detalle")
     SalonDetalleDTO obtenerDetalleSalon(@PathVariable("id") Integer id);
 
-    @GetMapping("/api/v1/salones/{id}/detalle")
-    Object obtenerSalonDetalleCrudo(@PathVariable("id") Integer id);
-
     @GetMapping("/api/v1/salones/{id}")
     Object obtenerSalonPorIdCrudo(@PathVariable("id") Integer id);
 
     @GetMapping("/api/v1/salones/propietario")
     Object obtenerSalonesPropietario();
+
+    @GetMapping("/api/v1/salones/publicados")
+    Object obtenerSalonesPublicados();
+
+    @GetMapping("/api/v1/salones")
+    Object obtenerTodosLosSalones();
+
+    @GetMapping("/api/v1/salones/{id}/servicios")
+    Object obtenerServiciosPorSalon(@PathVariable("id") Integer id);
 
     @GetMapping("/api/v1/servicios")
     Object obtenerCatalogoServicios();
@@ -35,4 +41,15 @@ public interface SalonClient {
 
     @PostMapping("/api/v1/salones/{id}/disponibilidad")
     void bloquearFechaEnCalendario(@PathVariable("id") Integer id, @RequestBody Map<String, Object> bloqueoPayload);
+
+    @GetMapping("/api/v1/salones/catalogo")
+    Object obtenerSalonesCatalogo();
+
+    @GetMapping("/api/v1/salones/publico")
+    Object obtenerSalonesPublico();
+
+    @GetMapping("/api/v1/salones/{id}/detalle")
+    Object obtenerSalonDetalleCrudo(@PathVariable("id") Integer id);
+
+
 }

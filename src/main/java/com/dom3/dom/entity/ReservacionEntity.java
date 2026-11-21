@@ -24,6 +24,11 @@ public class ReservacionEntity {
     private String estado_reservacion;
     private BigDecimal costo_total;
     private Integer numero_invitados;
+    @Column(name = "hora_inicio")
+    private String hora_inicio;
+
+    @Column(name = "hora_fin")
+    private String hora_fin;
     
     private Integer Usuariosid_user;
     private Integer Salonid_salon;
@@ -40,4 +45,6 @@ public class ReservacionEntity {
 
     @OneToMany(mappedBy = "reservacion", cascade = CascadeType.ALL)
     private List<PagosEntity> pagos;
+
+    
 }

@@ -11,4 +11,7 @@ public interface PagosRepository extends JpaRepository<PagosEntity, Integer> {
     //validacion de cuplicados
     @Query("SELECT COUNT(p) > 0 FROM PagosEntity p WHERE p.id_transaccion_pasarela = :txId")
     boolean existeTransaccion(@Param("txId") String txId);
+
+    @Query("SELECT COUNT(p) > 0 FROM PagosEntity p WHERE p.id_transaccion_pasarela = :referencia")
+    boolean existsByIdTransaccionPasarela(@Param("referencia") String referencia);
 }

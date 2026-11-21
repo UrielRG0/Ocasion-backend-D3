@@ -12,6 +12,7 @@ import com.dom3.dom.dto.InventarioOcupadoDTO;
 import com.dom3.dom.dto.InventarioSolicitadoDTO;
 import com.dom3.dom.dto.PagoRequestDTO;
 import com.dom3.dom.dto.PagoResponseDTO;
+import com.dom3.dom.dto.ReservacionDetalleResponseDTO;
 import com.dom3.dom.dto.SalonDetalleDTO;
 import com.dom3.dom.dto.ServicioSolicitadoDTO;
 import com.dom3.dom.dto.SolicitudEnviadaDTO;
@@ -28,6 +29,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -43,16 +45,21 @@ public class ReservacionService {
     private final ReservacionRepository reservacionRepository;
     private final PagosRepository pagosRepository;
     private final SalonClient salonClient;
+    private final DatosExternosService datosExternosService;
+    private final PayPalService payPalService;
 
     public ReservacionService(
-            ReservacionRepository reservacionRepository,
-            PagosRepository pagosRepository,
-            SalonClient salonClient) {
-        this.reservacionRepository = reservacionRepository;
-        this.pagosRepository = pagosRepository;
-        this.salonClient = salonClient;
-    }
-
+        ReservacionRepository reservacionRepository,
+        PagosRepository pagosRepository,
+        SalonClient salonClient,
+        DatosExternosService datosExternosService,
+        PayPalService payPalService) {
+    this.reservacionRepository = reservacionRepository;
+    this.pagosRepository = pagosRepository;
+    this.salonClient = salonClient;
+    this.datosExternosService = datosExternosService;
+    this.payPalService = payPalService;
+}
     // 1. Calendario y capacidad del salón
     public CalendarioSalonDTO obtenerCalendarioCliente(Integer idSalon) {
         Integer capacidad = 150;
@@ -96,8 +103,20 @@ public class ReservacionService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "La fecha de fin no puede ser anterior a la de inicio");
         }
 
-        if (reservacionRepository.existeEmpalmeFechas(request.getIdSalon(), request.getFechaInicio(), request.getFechaFin())) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Lo sentimos, esta fecha acaba de ser ocupada");
+        if (request.getHoraInicio() != null && !request.getHoraInicio().isBlank() &&
+            request.getHoraFin() != null && !request.getHoraFin().isBlank()) {
+            if (existeEmpalmeHorario(
+                    request.getIdSalon(),
+                    request.getFechaInicio(),
+                    request.getHoraInicio(),
+                    request.getFechaFin(),
+                    request.getHoraFin())) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Lo sentimos, este horario acaba de ser ocupado");
+            }
+        } else {
+            if (reservacionRepository.existeEmpalmeFechas(request.getIdSalon(), request.getFechaInicio(), request.getFechaFin())) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Lo sentimos, esta fecha acaba de ser ocupada");
+            }
         }
 
         try {
@@ -119,37 +138,126 @@ public class ReservacionService {
             System.out.println("Aviso Dominio 2 al solicitar: " + e.getMessage());
         }
 
+        // Calcular renta base inicial según horas rentadas * precio_hora del salón en Dominio 2
+        List<Object> fuentesSalon = datosExternosService.obtenerFuentesSalon(request.getIdSalon());
+        DatosExternosService.InfoSalonResuelta infoSalon =
+                datosExternosService.extraerInfoSalon(fuentesSalon, request.getIdSalon());
+        BigDecimal horasRentadas = datosExternosService.calcularHorasRentadas(
+                request.getFechaInicio(), request.getHoraInicio(), request.getFechaFin(), request.getHoraFin()
+        );
+        BigDecimal costoBaseInicial = infoSalon.precioHora()
+                .multiply(horasRentadas)
+                .setScale(2, java.math.RoundingMode.HALF_UP);
+
         ReservacionEntity nueva = ReservacionEntity.builder()
                 .fecha_inicio(request.getFechaInicio())
                 .fecha_fin(request.getFechaFin())
+                .hora_inicio(request.getHoraInicio())
+                .hora_fin(request.getHoraFin())
                 .estado_reservacion("SOLICITUD_NUEVA")
-                .costo_total(BigDecimal.ZERO)
+                .costo_total(costoBaseInicial)
                 .numero_invitados(request.getNumeroInvitados())
                 .Usuariosid_user(idUser)
                 .Salonid_salon(request.getIdSalon())
                 .check_in_realizado(false)
                 .build();
 
+       
+
+        // Guardar en BD los servicios enviados por el cliente o los configurados en el salón en Dominio 2
+        List<ReservacionServiciosEntity> listaServicios = new ArrayList<>();
         if (request.getServicios() != null && !request.getServicios().isEmpty()) {
-            List<ReservacionServiciosEntity> listaServicios = new ArrayList<>();
             for (ServicioSolicitadoDTO s : request.getServicios()) {
+                int cant = (s.getCantidad() != null && s.getCantidad() > 0) ? s.getCantidad() : 1;
                 listaServicios.add(ReservacionServiciosEntity.builder()
                         .reservacion(nueva)
                         .Serviciosid_servicio(s.getIdServicio())
                         .precio_contratado(BigDecimal.ZERO)
-                        .serviciosSolicitadosReservacion(1)
+                        .serviciosSolicitadosReservacion(cant)
                         .build());
             }
+        } else {
+            List<DatosExternosService.ServicioConfiguradoSalon> serviciosSalon =
+                    datosExternosService.obtenerServiciosConfiguradosEnSalon(request.getIdSalon());
+            for (DatosExternosService.ServicioConfiguradoSalon sc : serviciosSalon) {
+                listaServicios.add(ReservacionServiciosEntity.builder()
+                        .reservacion(nueva)
+                        .Serviciosid_servicio(sc.idServicio())
+                        .precio_contratado(BigDecimal.ZERO)
+                        .serviciosSolicitadosReservacion(sc.cantidad())
+                        .build());
+            }
+        }
+
+        if (!listaServicios.isEmpty()) {
             nueva.setServicios(listaServicios);
         }
 
         ReservacionEntity guardada = reservacionRepository.save(nueva);
+        ReservacionDetalleResponseDTO enriquecida = datosExternosService.enriquecerReservacion(guardada);
 
         return SolicitudEnviadaDTO.builder()
                 .idReservacion(guardada.getId_reservacion())
                 .estado(guardada.getEstado_reservacion())
-                .mensaje("Solicitud enviada al propietario. Recibirás una notificación cuando se arme tu cotización.")
+                .nombreSalon(enriquecida.getNombreSalon())
+                .fechaInicio(guardada.getFecha_inicio())
+                .fechaFin(guardada.getFecha_fin())
+                .horaInicio(guardada.getHora_inicio())
+                .horaFin(guardada.getHora_fin())
+                .servicios(enriquecida.getServicios())
+                .mensaje("Solicitud enviada al propietario con los servicios del salón.")
                 .build();
+    }
+
+    private boolean existeEmpalmeHorario(
+            Integer idSalon,
+            LocalDate fechaInicio,
+            String horaInicioStr,
+            LocalDate fechaFin,
+            String horaFinStr) {
+
+        java.time.LocalTime horaInicio = parsearHoraFlexible(horaInicioStr, java.time.LocalTime.MIN);
+        java.time.LocalTime horaFin = parsearHoraFlexible(horaFinStr, java.time.LocalTime.MAX);
+
+        LocalDateTime inicioNuevo = LocalDateTime.of(fechaInicio, horaInicio);
+        LocalDateTime finNuevo = LocalDateTime.of(fechaFin, horaFin);
+
+        if (!finNuevo.isAfter(inicioNuevo)) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "La fecha y hora de fin deben ser posteriores a la fecha y hora de inicio"
+            );
+        }
+
+        List<ReservacionEntity> candidatas = reservacionRepository.findActivasEnRango(idSalon, fechaInicio, fechaFin);
+        for (ReservacionEntity r : candidatas) {
+            java.time.LocalTime hIniExistente = parsearHoraFlexible(r.getHora_inicio(), java.time.LocalTime.MIN);
+            java.time.LocalTime hFinExistente = parsearHoraFlexible(r.getHora_fin(), java.time.LocalTime.MAX);
+
+            LocalDateTime inicioExistente = LocalDateTime.of(r.getFecha_inicio(), hIniExistente);
+            LocalDateTime finExistente = LocalDateTime.of(r.getFecha_fin(), hFinExistente);
+
+            if (inicioNuevo.isBefore(finExistente) && finNuevo.isAfter(inicioExistente)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private java.time.LocalTime parsearHoraFlexible(String valor, java.time.LocalTime porDefecto) {
+        if (valor == null || valor.isBlank()) return porDefecto;
+        try {
+            String limpio = valor.trim();
+            if (limpio.contains("T")) {
+                limpio = limpio.substring(limpio.indexOf('T') + 1);
+            }
+            if (limpio.length() > 8) {
+                limpio = limpio.substring(0, 8);
+            }
+            return java.time.LocalTime.parse(limpio);
+        } catch (Exception e) {
+            return porDefecto;
+        }
     }
 
     // 3. Cotización directa con inventario (Estado: COTIZACION_PENDIENTE)
@@ -298,28 +406,14 @@ public class ReservacionService {
     public ReservacionEntity armarCotizacionPropietario(Integer idReservacion, ArmarCotizacionPropietarioDTO dto) {
         ReservacionEntity reservacion = obtenerReservacion(idReservacion);
 
-        BigDecimal totalCalculado = dto.getPrecioRentaSalon() != null ? dto.getPrecioRentaSalon() : BigDecimal.ZERO;
-
-        if (dto.getServicios() != null) {
-            if (reservacion.getServicios() == null) {
-                reservacion.setServicios(new ArrayList<>());
-            } else {
-                reservacion.getServicios().clear();
-            }
-
-            for (ArmarCotizacionPropietarioDTO.ServicioCotizadoItemDTO sDto : dto.getServicios()) {
-                BigDecimal precioUnitario = sDto.getPrecioContratado() != null ? sDto.getPrecioContratado() : BigDecimal.ZERO;
-                int cant = (sDto.getCantidad() != null && sDto.getCantidad() > 0) ? sDto.getCantidad() : 1;
-
-                reservacion.getServicios().add(ReservacionServiciosEntity.builder()
-                        .reservacion(reservacion)
-                        .Serviciosid_servicio(sDto.getIdServicio())
-                        .precio_contratado(precioUnitario)
-                        .serviciosSolicitadosReservacion(cant)
-                        .build());
-
-                totalCalculado = totalCalculado.add(precioUnitario.multiply(BigDecimal.valueOf(cant)));
-            }
+        BigDecimal totalCalculado;
+        if (dto.getPrecioRentaSalon() != null && dto.getPrecioRentaSalon().compareTo(BigDecimal.ZERO) > 0) {
+            totalCalculado = dto.getPrecioRentaSalon();
+        } else {
+            List<Object> fuentes = datosExternosService.obtenerFuentesSalon(reservacion.getSalonid_salon());
+            DatosExternosService.InfoSalonResuelta infoSalon =
+                    datosExternosService.extraerInfoSalon(fuentes, reservacion.getSalonid_salon());
+            totalCalculado = datosExternosService.calcularRentaBasePorHoras(reservacion, infoSalon.precioHora());
         }
 
         if (dto.getInventario() != null) {
@@ -344,7 +438,6 @@ public class ReservacionService {
         return reservacionRepository.save(reservacion);
     }
 
-    // 8. Aprobar o Rechazar solicitud / cotización
     // 8. Aprobar o Rechazar solicitud / cotización
     @Transactional
     public ReservacionEntity actualizarEstado(Integer idReservacion, ActualizarEstadoDTO dto) {
@@ -395,10 +488,13 @@ public class ReservacionService {
         }
 
         // Si el propietario rechaza la solicitud o el cliente cancela la cotización, se libera el inventario
-        if ("RECHAZADA_PROPIETARIO".equals(nuevoEstado) || "CANCELADA_CLIENTE".equals(nuevoEstado)) {
-            if (reservacion.getInventario() != null) {
-                reservacion.getInventario().clear();
-            }
+        if (("RECHAZADA_PROPIETARIO".equals(nuevoEstado) || "CANCELADA_CLIENTE".equals(nuevoEstado))
+                && reservacion.getPagos() != null
+                && reservacion.getPagos().stream().anyMatch(p -> "COMPLETADO".equalsIgnoreCase(p.getEstadoPago()))) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No se puede rechazar o cancelar una reservación que ya cuenta con pagos completados"
+            );
         }
 
         reservacion.setEstado_reservacion(nuevoEstado);
@@ -517,7 +613,7 @@ public class ReservacionService {
         return PagoResponseDTO.builder()
                 .idPago(pagoGuardado.getId_pago())
                 .monto(pagoGuardado.getMonto())
-                .tipoPago(pagoGuardado.getTipo_pago())
+                .metodoPago(pagoGuardado.getTipo_pago())
                 .estadoPago(pagoGuardado.getEstadoPago())
                 .metodoPago(pagoGuardado.getMetodo_pago())
                 .totalPagado(nuevoTotalPagado)
@@ -550,202 +646,175 @@ public class ReservacionService {
                 .build();
     }
 
+    // 12. Eliminar reservación (solo si no está confirmada ni tiene pagos)
+    @Transactional
+    public void eliminarReservacion(Integer idReservacion, Integer idUsuarioAutenticado) {
+        ReservacionEntity reservacion = obtenerReservacion(idReservacion);
 
+        var authorities = org.springframework.security.core.context.SecurityContextHolder
+                .getContext().getAuthentication().getAuthorities();
+        boolean esPropietario = authorities.stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_VENDEDOR") || a.getAuthority().equals("ROLE_PROPIETARIO"));
+
+        if (!esPropietario && !reservacion.getUsuariosid_user().equals(idUsuarioAutenticado)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "No tienes permiso para eliminar esta reservación");
+        }
+
+        if ("CONFIRMADA".equalsIgnoreCase(reservacion.getEstado_reservacion()) ||
+            (reservacion.getPagos() != null && !reservacion.getPagos().isEmpty())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No se puede eliminar una reservación confirmada o con pagos registrados"
+            );
+        }
+
+        reservacionRepository.delete(reservacion);
+    }
+
+    @Transactional
+    public PagoResponseDTO procesarPagoPayPalVerificado(Integer idReservacion, String orderId, String tipoPagoSolicitado) {
+        if (orderId == null || orderId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "El orderId de PayPal es obligatorio");
+        }
+
+        // 1. Evitar duplicados si este orderId ya fue registrado previamente
+        if (pagosRepository.existsByIdTransaccionPasarela(orderId)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Esta orden de PayPal ya fue procesada anteriormente");
+        }
+
+        ReservacionEntity r = obtenerReservacion(idReservacion);
+
+        if ("RECHAZADA".equalsIgnoreCase(r.getEstado_reservacion()) ||
+            "CANCELADA".equalsIgnoreCase(r.getEstado_reservacion())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "La reservación está cancelada o rechazada");
+        }
+
+        // 2. Capturar y verificar el pago directamente en la API de PayPal
+        PayPalService.CapturaPayPalVerificada captura = payPalService.capturarYVerificarOrden(orderId);
+
+        // Evitar duplicados también por captureId devuelto por PayPal
+        if (pagosRepository.existsByIdTransaccionPasarela(captura.captureId())) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Esta captura de PayPal ya fue registrada");
+        }
+
+        BigDecimal montoAbono = captura.montoPagado();
+        if (montoAbono == null || montoAbono.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "El monto verificado en PayPal no es válido");
+        }
+
+        // 3. Calcular total pagado previo y saldo pendiente
+        BigDecimal totalPagadoPrevio = (r.getPagos() == null) ? BigDecimal.ZERO :
+                r.getPagos().stream()
+                        .filter(p -> "COMPLETADO".equalsIgnoreCase(p.getEstadoPago()) && p.getMonto() != null)
+                        .map(PagosEntity::getMonto)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal costoTotal = (r.getCosto_total() != null) ? r.getCosto_total() : BigDecimal.ZERO;
+        BigDecimal saldoAntes = costoTotal.subtract(totalPagadoPrevio);
+
+        if (saldoAntes.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "La reservación ya está liquidada");
+        }
+
+        // Si es el primer pago (anticipo), validar mínimo del 30% del costo total
+        if (totalPagadoPrevio.compareTo(BigDecimal.ZERO) == 0) {
+            BigDecimal anticipoMinimo = costoTotal
+                    .multiply(new BigDecimal("0.30"))
+                    .setScale(2, RoundingMode.HALF_UP);
+            if (montoAbono.compareTo(anticipoMinimo) < 0) {
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_REQUEST,
+                        "El primer anticipo debe ser de al menos el 30% ($" + anticipoMinimo + " MXN)"
+                );
+            }
+        }
+
+        BigDecimal nuevoTotalPagado = totalPagadoPrevio.add(montoAbono);
+        BigDecimal nuevoSaldo = costoTotal.subtract(nuevoTotalPagado).max(BigDecimal.ZERO);
+
+        String tipoPagoFinal = (nuevoSaldo.compareTo(BigDecimal.ZERO) == 0)
+                ? "LIQUIDACION"
+                : (totalPagadoPrevio.compareTo(BigDecimal.ZERO) == 0
+                        ? "ANTICIPO"
+                        : (tipoPagoSolicitado != null && !tipoPagoSolicitado.isBlank() ? tipoPagoSolicitado : "ABONO"));
+
+        // 4. Construir y guardar el registro en la tabla Pagos con los nombres exactos
+        PagosEntity nuevoPago = PagosEntity.builder()
+                .reservacion(r)
+                .monto(montoAbono)
+                .fecha_pago(LocalDate.now())
+                .tipo_pago(tipoPagoFinal)
+                .estadoPago("COMPLETADO")
+                .metodo_pago("PAYPAL")
+                .id_transaccion_pasarela(captura.captureId())
+                .build();
+
+        if (r.getPagos() == null) {
+            r.setPagos(new ArrayList<>());
+        }
+        r.getPagos().add(nuevoPago);
+
+        // 5. Actualizar estado de la reservación y generar token_qr si aún no existe
+        if (nuevoSaldo.compareTo(BigDecimal.ZERO) == 0) {
+            r.setEstado_reservacion("CONFIRMADA");
+        } else {
+            r.setEstado_reservacion("ANTICIPO_PAGADO");
+        }
+
+        if (r.getToken_qr() == null || r.getToken_qr().isBlank()) {
+            String sufijo = java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+            r.setToken_qr("OCASION-RES-" + r.getId_reservacion() + "-" + sufijo);
+        }
+
+        ReservacionEntity guardada = reservacionRepository.save(r);
+        PagosEntity pagoGuardado = guardada.getPagos().get(guardada.getPagos().size() - 1);
+
+        // 6. Bloquear fecha/horario en Dominio 2 al acreditarse el primer pago
+        if (totalPagadoPrevio.compareTo(BigDecimal.ZERO) == 0) {
+            try {
+                salonClient.bloquearFechaEnCalendario(r.getSalonid_salon(), Map.of(
+                        "fecha", r.getFecha_inicio().toString(),
+                        "hora_inicio", r.getHora_inicio() != null ? r.getHora_inicio() : "00:00",
+                        "hora_fin", r.getHora_fin() != null ? r.getHora_fin() : "23:59",
+                        "tipo_bloqueo", "reservacion"
+                ));
+            } catch (Exception e) {
+                System.out.println("Aviso al bloquear calendario en Dominio 2: " + e.getMessage());
+            }
+        }
+
+        // 7. Notificar al propietario
+        notificarPagoAlPropietario(guardada, pagoGuardado, nuevoSaldo);
+
+        return PagoResponseDTO.builder()
+                .idPago(pagoGuardado.getId_pago())
+                .monto(pagoGuardado.getMonto())
+                .estadoPago(pagoGuardado.getEstadoPago())
+                .metodoPago(pagoGuardado.getMetodo_pago())
+                .idTransaccionPasarela(pagoGuardado.getId_transaccion_pasarela())
+                .idReservacion(guardada.getId_reservacion())
+                .estadoReservacion(guardada.getEstado_reservacion())
+                .totalPagado(nuevoTotalPagado)
+                .saldoPendiente(nuevoSaldo)
+                .tokenQr(guardada.getToken_qr())
+                .mensaje(nuevoSaldo.compareTo(BigDecimal.ZERO) == 0
+                        ? "¡Pago liquidado! Tu reservación está confirmada y lista con su pase QR."
+                        : "Abono registrado con éxito. Tu fecha quedó apartada; puedes liquidar el saldo restante cuando gustes.")
+                .build();
+    }
+
+    private void notificarPagoAlPropietario(ReservacionEntity r, PagosEntity pago, BigDecimal saldoRestante) {
+        System.out.printf(
+                "[NOTIFICACIÓN PROPIETARIO] Reservación #%d (Salón ID %d) recibió %s por $%s MXN vía %s (Ref: %s). Nuevo estado: %s | Saldo pendiente: $%s MXN%n",
+                r.getId_reservacion(),
+                r.getSalonid_salon(),
+                pago.getTipo_pago(),
+                pago.getMonto(),
+                pago.getMetodo_pago(),
+                pago.getId_transaccion_pasarela(),
+                r.getEstado_reservacion(),
+                saldoRestante
+        );
+    }
 }
 
-/*package com.dom3.dom.service;
-
-import com.dom3.dom.client.SalonClient;
-import com.dom3.dom.dto.*;
-import com.dom3.dom.entity.ReservacionEntity;
-import com.dom3.dom.entity.ReservacionInventarioEntity;
-import com.dom3.dom.entity.ReservacionServiciosEntity;
-import com.dom3.dom.repository.ReservacionRepository;
-import org.springframework.http.HttpStatus;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
-
-import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-
-@Service
-public class ReservacionService {
-
-    private final ReservacionRepository reservacionRepository;
-    private final SalonClient salonClient;
-
-    public ReservacionService(ReservacionRepository reservacionRepository, SalonClient salonClient) {
-        this.reservacionRepository = reservacionRepository;
-        this.salonClient = salonClient;
-    }
-
-    public CalendarioSalonDTO obtenerCalendarioCliente(Integer idSalon) {
-        SalonDetalleDTO detalleSalon;
-        try {
-            detalleSalon = salonClient.obtenerDetalleSalon(idSalon);
-        } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "El servicio de validación de salones no está disponible temporalmente. Intente más tarde.");
-        }
-
-        List<LocalDate> fechasBloqueadas = new ArrayList<>();
-        if (detalleSalon.getFechasMantenimiento() != null) {
-            fechasBloqueadas.addAll(detalleSalon.getFechasMantenimiento());
-        }
-
-        List<ReservacionEntity> reservasConfirmadas = reservacionRepository.findFechasOcupadasBySalonId(idSalon);
-        for (ReservacionEntity res : reservasConfirmadas) {
-            long numOfDaysBetween = ChronoUnit.DAYS.between(res.getFecha_inicio(), res.getFecha_fin());
-            Stream.iterate(res.getFecha_inicio(), date -> date.plusDays(1))
-                  .limit(numOfDaysBetween + 1)
-                  .forEach(fechasBloqueadas::add);
-        }
-
-        return CalendarioSalonDTO.builder()
-                .capacidadMaximaPersonas(detalleSalon.getCapacidadPersonas())
-                .fechasBloqueadas(fechasBloqueadas)
-                .build();
-    }
-
-    @Transactional
-    public Map<String, Object> crearSolicitudCliente(SolicitudReservaDTO dto, Integer idUserToken) {
-        SalonDetalleDTO detalleSalon;
-        try {
-            detalleSalon = salonClient.obtenerDetalleSalon(dto.getIdSalon());
-        } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "El servicio de validación de salones no está disponible temporalmente.");
-        }
-
-        if (dto.getNumeroInvitados() > detalleSalon.getCapacidadPersonas()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Error: El número de invitados excede la capacidad máxima física del salón (" + detalleSalon.getCapacidadPersonas() + " max).");
-        }
-
-        List<ReservacionEntity> reservasConfirmadas = reservacionRepository.findFechasOcupadasBySalonId(dto.getIdSalon());
-        boolean hayChoque = reservasConfirmadas.stream().anyMatch(res -> 
-            !(dto.getFechaFin().isBefore(res.getFecha_inicio()) || dto.getFechaInicio().isAfter(res.getFecha_fin()))
-        );
-
-        if (hayChoque) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Lo sentimos, las fechas seleccionadas acaban de ser bloqueadas.");
-        }
-
-        ReservacionEntity reservacion = ReservacionEntity.builder()
-                .fecha_inicio(dto.getFechaInicio())
-                .fecha_fin(dto.getFechaFin())
-                .estado_reservacion("SOLICITUD_NUEVA")
-                .Usuariosid_user(idUserToken)
-                .Salonid_salon(dto.getIdSalon())
-                .numero_invitados(dto.getNumeroInvitados())
-                .check_in_realizado(false)
-                .build();
-
-        if (dto.getServicios() != null) {
-            List<ReservacionServiciosEntity> servicios = dto.getServicios().stream().map(s -> 
-                ReservacionServiciosEntity.builder()
-                    .reservacion(reservacion)
-                    .Serviciosid_servicio(s.getIdServicio())
-                    .serviciosSolicitadosReservacion(1)
-                    .build()
-            ).toList();
-            reservacion.setServicios(servicios);
-        }
-
-        reservacionRepository.save(reservacion);
-
-        return Map.of("mensaje", "Solicitud enviada al propietario. Recibirás una notificación cuando se arme tu cotización.");
-    }
-
-    @Transactional
-    public CotizacionResponseDTO crearCotizacion(CotizacionRequestDTO request) {
-        String userIdString = (String) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
-        Integer idUser = Integer.parseInt(userIdString);
-
-        BigDecimal costoTotalSimulado = new BigDecimal("5000.00"); 
-
-        ReservacionEntity reservacion = ReservacionEntity.builder()
-                .fecha_inicio(request.getFechaInicio())
-                .fecha_fin(request.getFechaFin())
-                .estado_reservacion("COTIZACION_PENDIENTE")
-                .costo_total(costoTotalSimulado)
-                .Usuariosid_user(idUser) 
-                .Salonid_salon(request.getIdSalon())
-                .check_in_realizado(false)
-                .build();
-
-        if (request.getServicios() != null) {
-            List<ReservacionServiciosEntity> servicios = request.getServicios().stream().map(dto -> 
-                ReservacionServiciosEntity.builder()
-                    .reservacion(reservacion) 
-                    .Serviciosid_servicio(dto.getIdServicio())
-                    .precio_contratado(new BigDecimal("500.00")) 
-                    .serviciosSolicitadosReservacion(1)
-                    .build()
-            ).collect(Collectors.toList());
-            reservacion.setServicios(servicios);
-        }
-
-        if (request.getInventario() != null) {
-            List<ReservacionInventarioEntity> inventario = request.getInventario().stream().map(dto -> 
-                ReservacionInventarioEntity.builder()
-                    .reservacion(reservacion) 
-                    .Inventario_Salonid_recurso(dto.getIdRecurso())
-                    .cantidad_asignada(dto.getCantidadAsignada())
-                    .build()
-            ).collect(Collectors.toList());
-            reservacion.setInventario(inventario);
-        }
-
-        ReservacionEntity guardada = reservacionRepository.save(reservacion);
-
-        return CotizacionResponseDTO.builder()
-                .idReservacion(guardada.getId_reservacion())
-                .estado(guardada.getEstado_reservacion())
-                .costoTotal(guardada.getCosto_total())
-                .mensaje("Cotización creada con éxito")
-                .build();
-    }
-
-    public ReservacionEntity obtenerReservacion(Integer idReservacion) {
-        return reservacionRepository.findById(idReservacion)
-                .orElseThrow(() -> new RuntimeException("Reservación no encontrada"));
-    }
-
-    @Transactional
-    public PagoResponseDTO procesarPago(Integer idReservacion, com.dom3.dom.dto.PagoRequestDTO pagoRequest) {
-        ReservacionEntity reservacion = reservacionRepository.findById(idReservacion)
-                .orElseThrow(() -> new RuntimeException("Reservación no encontrada"));
-
-        reservacion.setEstado_reservacion("CONFIRMADA");
-
-        com.dom3.dom.entity.PagosEntity nuevoPago = com.dom3.dom.entity.PagosEntity.builder()
-                .reservacion(reservacion)
-                .monto(pagoRequest.getMonto())
-                .fecha_pago(LocalDate.now())
-                .tipo_pago("ANTICIPO")
-                .estadoPago("COMPLETADO")
-                .metodo_pago(pagoRequest.getMetodoPago())
-                .id_transaccion_pasarela("TXN-" + System.currentTimeMillis())
-                .build();
-
-        if (reservacion.getPagos() == null) {
-            reservacion.setPagos(new ArrayList<>());
-        }
-        reservacion.getPagos().add(nuevoPago);
-        
-        reservacionRepository.save(reservacion);
-
-        return com.dom3.dom.dto.PagoResponseDTO.builder()
-                .idPago(nuevoPago.getId_pago())
-                .monto(nuevoPago.getMonto())
-                .estadoPago(nuevoPago.getEstadoPago())
-                .metodoPago(nuevoPago.getMetodo_pago())
-                .build();
-    }
-} */
