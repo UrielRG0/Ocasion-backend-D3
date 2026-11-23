@@ -3,8 +3,6 @@ package com.dom3.dom.service;
 import com.dom3.dom.dto.ReservacionDetalleResponseDTO;
 import com.dom3.dom.entity.PagosEntity;
 import com.dom3.dom.entity.ReservacionEntity;
-import com.dom3.dom.entity.ReservacionInventarioEntity;
-import com.dom3.dom.entity.ReservacionServiciosEntity;
 import com.lowagie.text.Document;
 import com.lowagie.text.Element;
 import com.lowagie.text.Font;
@@ -19,6 +17,16 @@ import com.lowagie.text.pdf.PdfPTable;
 import com.lowagie.text.pdf.PdfWriter;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
+
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.client.j2se.MatrixToImageWriter;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 
 import java.awt.Color;
 import java.io.ByteArrayOutputStream;
@@ -35,12 +43,16 @@ public class PdfCotizacionService {
     public PdfCotizacionService(DatosExternosService datosExternosService) {
         this.datosExternosService = datosExternosService;
     }
-
+    
     public byte[] generarPdfReservacion(ReservacionEntity r) {
+        return generarPdfReservacion(r, true);
+    }
+
+    public byte[] generarPdfReservacion(ReservacionEntity r, boolean incluirQr) {
         ReservacionDetalleResponseDTO detalle = datosExternosService.enriquecerReservacion(r);
         List<Object> fuentesSalon = datosExternosService.obtenerFuentesSalon(r.getSalonid_salon());
         DatosExternosService.InfoSalonResuelta salonInfo = datosExternosService.extraerInfoSalon(fuentesSalon, r.getSalonid_salon());
-
+   
         try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             Document document = new Document(PageSize.LETTER, 36, 36, 32, 32);
             PdfWriter.getInstance(document, out);
@@ -241,14 +253,37 @@ public class PdfCotizacionService {
             }
             document.add(tablaPagos);
 
-            // 6. CÓDIGO DE ACCESO QR
-            if (detalle.getToken_qr() != null && !detalle.getToken_qr().isBlank()) {
+       
+            // 6. CÓDIGO DE ACCESO QR (exclusivo del cliente y solo con pago completo / CONFIRMADA)
+            boolean pagadaCompleta = "CONFIRMADA".equalsIgnoreCase(detalle.getEstado_reservacion())
+                    && pendiente.compareTo(BigDecimal.ZERO) == 0;
+
+            if (incluirQr && pagadaCompleta && detalle.getToken_qr() != null && !detalle.getToken_qr().isBlank()) {
                 document.add(new Paragraph(" "));
-                Paragraph pQr = new Paragraph(
-                        "CLAVE DE VALIDACIÓN DE ACCESO (CHECK-IN): " + detalle.getToken_qr(),
-                        boldFont
+                Paragraph pQrTit = new Paragraph("PASE DE ACCESO QR (CHECK-IN):", boldFont);
+                pQrTit.setAlignment(Element.ALIGN_CENTER);
+                document.add(pQrTit);
+
+                Image qrImg = generarQrPdf(detalle.getToken_qr());
+                if (qrImg != null) {
+                    document.add(new Paragraph(" "));
+                    document.add(qrImg);
+                }
+
+                Paragraph pQrCode = new Paragraph("Token: " + detalle.getToken_qr(), normalFont);
+                pQrCode.setAlignment(Element.ALIGN_CENTER);
+                document.add(pQrCode);
+            } else if (pendiente.compareTo(BigDecimal.ZERO) > 0
+                    && !"RECHAZADA_PROPIETARIO".equalsIgnoreCase(detalle.getEstado_reservacion())
+                    && !"CANCELADA_CLIENTE".equalsIgnoreCase(detalle.getEstado_reservacion())
+                    && !"CADUCADA".equalsIgnoreCase(detalle.getEstado_reservacion())) {
+                document.add(new Paragraph(" "));
+                Paragraph pAvisoQr = new Paragraph(
+                        "El código QR de acceso se habilita al liquidar el 100% del saldo pendiente ($" + pendiente + " MXN).",
+                        normalFont
                 );
-                document.add(pQr);
+                pAvisoQr.setAlignment(Element.ALIGN_CENTER);
+                document.add(pAvisoQr);
             }
 
             document.add(new Paragraph(" "));
@@ -263,7 +298,10 @@ public class PdfCotizacionService {
         } catch (Exception e) {
             throw new RuntimeException("Error al generar PDF: " + e.getMessage(), e);
         }
+    
     }
+
+
     private Image cargarImagenEncabezado(String urlImagenSalon) {
         for (String ruta : List.of("static/img/logo-ocasion.png", "static/images/logo-ocasion.png")) {
             try {
@@ -317,5 +355,27 @@ public class PdfCotizacionService {
 
         table.addCell(c1);
         table.addCell(c2);
+    }
+
+    private com.lowagie.text.Image generarQrPdf(String tokenQr) {
+        if (tokenQr == null || tokenQr.isBlank()) {
+            return null;
+        }
+        try {
+            QRCodeWriter writer = new QRCodeWriter();
+            BitMatrix bitMatrix = writer.encode(tokenQr.trim(), BarcodeFormat.QR_CODE, 220, 220);
+            BufferedImage qrImage = MatrixToImageWriter.toBufferedImage(bitMatrix);
+
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                ImageIO.write(qrImage, "PNG", baos);
+                com.lowagie.text.Image pdfImg = com.lowagie.text.Image.getInstance(baos.toByteArray());
+                pdfImg.scaleAbsolute(110f, 110f);
+                pdfImg.setAlignment(com.lowagie.text.Element.ALIGN_CENTER);
+                return pdfImg;
+            }
+        } catch (Exception e) {
+            System.err.println("No se pudo generar imagen QR en PDF: " + e.getMessage());
+            return null;
+        }
     }
 }

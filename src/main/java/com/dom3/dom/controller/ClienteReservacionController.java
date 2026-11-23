@@ -12,6 +12,8 @@ import com.dom3.dom.service.DatosExternosService;
 import com.dom3.dom.service.PayPalService;
 import com.dom3.dom.service.PdfCotizacionService;
 import com.dom3.dom.service.ReservacionService;
+
+import jakarta.annotation.PostConstruct;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -25,6 +27,7 @@ import java.util.Map;
 
 import java.math.BigDecimal;
 import java.util.List;
+import jakarta.annotation.PostConstruct;
 
 @RestController
 @RequestMapping("/api/v1/reservaciones")
@@ -70,18 +73,6 @@ public class ClienteReservacionController {
         Integer idUser = obtenerUsuarioAutenticadoId();
         List<ReservacionEntity> lista = reservacionService.listarPorCliente(idUser);
         return ResponseEntity.ok(datosExternosService.enriquecerLista(lista));
-    }
-
-    // Descargar PDF de cotización / comprobante
-    @GetMapping("/{id}/pdf")
-    public ResponseEntity<byte[]> descargarPdfReservacion(@PathVariable Integer id) {
-        ReservacionEntity reservacion = reservacionService.obtenerReservacion(id);
-        byte[] pdfBytes = pdfCotizacionService.generarPdfReservacion(reservacion);
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=cotizacion-ocasion-" + id + ".pdf")
-                .contentType(MediaType.APPLICATION_PDF)
-                .body(pdfBytes);
     }
 
     // Aceptar o cancelar cotización
@@ -153,7 +144,31 @@ public class ClienteReservacionController {
         return ResponseEntity.ok(respuesta);
     }
 
+    @GetMapping("/{id}/pdf")
+    public ResponseEntity<byte[]> descargarPdfReservacion(
+            @PathVariable Integer id,
+            @RequestParam(required = false) Boolean incluirQr) {
+
+        ReservacionEntity reservacion = reservacionService.obtenerReservacion(id);
+
+        boolean esPropietario = SecurityContextHolder.getContext().getAuthentication() != null
+                && SecurityContextHolder.getContext().getAuthentication().getAuthorities().stream()
+                        .anyMatch(a -> a.getAuthority().equals("ROLE_VENDEDOR")
+                                || a.getAuthority().equals("ROLE_PROPIETARIO"));
+
+        boolean mostrarQr = (incluirQr != null) ? (incluirQr && !esPropietario) : !esPropietario;
+        byte[] pdfBytes = pdfCotizacionService.generarPdfReservacion(reservacion, mostrarQr);
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=cotizacion-ocasion-" + id + ".pdf")
+                .contentType(MediaType.APPLICATION_PDF)
+                .body(pdfBytes);
+    }
+
+    
+
+}
+
     
 
     
-}

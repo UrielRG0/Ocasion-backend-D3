@@ -9,7 +9,6 @@ import lombok.NoArgsConstructor;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
 import java.util.List;
 
 @Data
@@ -27,6 +26,7 @@ public class ReservacionDetalleResponseDTO {
     private BigDecimal totalPagado;
     private BigDecimal saldoPendiente;
     private Integer numero_invitados;
+    private String telefonoCliente;
 
     // Datos resueltos del Cliente (Dominio 1)
     private Integer Usuariosid_user;

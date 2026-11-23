@@ -11,8 +11,9 @@ public class ArmarCotizacionPropietarioDTO {
     @NotNull(message = "El precio base del salón es obligatorio")
     private BigDecimal precioRentaSalon;
 
-    private List<ServicioCotizadoItemDTO> servicios;
     private List<InventarioSolicitadoDTO> inventario;
+    private List<ServicioCotizadoDTO> servicios_cotizados;
+    private List<ServicioCotizadoDTO> servicios;
     private String observaciones;
 
     @Data

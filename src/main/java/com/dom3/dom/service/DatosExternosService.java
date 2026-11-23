@@ -7,25 +7,23 @@ import com.dom3.dom.entity.PagosEntity;
 import com.dom3.dom.entity.ReservacionEntity;
 import com.dom3.dom.entity.ReservacionInventarioEntity;
 import com.dom3.dom.entity.ReservacionServiciosEntity;
-import org.springframework.boot.json.JsonParserFactory;
+
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
-import org.springframework.web.context.request.RequestContextHolder;
-import org.springframework.web.context.request.ServletRequestAttributes;
+import org.springframework.web.client.RestClient;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import org.springframework.beans.factory.annotation.Value;
 import java.util.Map;
 
 @Service
@@ -33,10 +31,83 @@ public class DatosExternosService {
 
     private final SalonClient salonClient;
     private final UsuarioClient usuarioClient;
+    private final TokenServicioAdmin tokenAdmin;
+    private final RestClient dominio1;
 
-    public DatosExternosService(SalonClient salonClient, UsuarioClient usuarioClient) {
+    private volatile Map<Integer, InfoClienteResuelta> cacheUsuarios = Map.of();
+    private volatile long cacheUsuariosExpira = 0;
+    private volatile long ultimoIntento = 0;
+
+    private final Map<Integer, Map<?, ?>> salonesPropietario = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public void registrarSalonesPropietario(List<?> lista) {
+        for (Object o : lista) {
+            if (o instanceof Map<?, ?> m) {
+                Object id = primero(m, "id_salon", "idSalon", "id");
+                if (id != null) salonesPropietario.put(Integer.valueOf(id.toString()), m);
+            }
+        }
+    }
+
+    private InfoClienteResuelta buscarEnListaAdmin(Integer idUser) {
+        long ahora = System.currentTimeMillis();
+        boolean vencido = ahora > cacheUsuariosExpira;
+        boolean falta = !cacheUsuarios.containsKey(idUser);
+        if ((vencido || falta) && ahora - ultimoIntento > 30_000) {
+            refrescarCacheUsuarios();
+        }
+        return cacheUsuarios.get(idUser);
+    }
+
+    private synchronized void refrescarCacheUsuarios() {
+        ultimoIntento = System.currentTimeMillis();
+        for (int intento = 0; intento < 2; intento++) {
+            try {
+                List<?> lista = dominio1.get().uri("/api/v1/usuarios")
+                        .header("Authorization", "Bearer " + tokenAdmin.obtenerToken())
+                        .retrieve().body(List.class);
+
+                Map<Integer, InfoClienteResuelta> nuevo = new HashMap<>();
+                if (lista != null) {
+                    for (Object o : lista) {
+                        if (o instanceof Map<?, ?> m && m.get("id_User") != null) {
+                            Integer id = Integer.valueOf(m.get("id_User").toString());
+                            InfoClienteResuelta info = mapearUsuario(m, id);
+                            if (info != null) nuevo.put(id, info);
+                        }
+                    }
+                }
+                cacheUsuarios = Map.copyOf(nuevo);          // reemplazo atómico
+                cacheUsuariosExpira = System.currentTimeMillis() + 5 * 60_000;
+                System.out.println("[Usuarios D1] cargados: " + nuevo.size() + " | ids: " + nuevo.keySet());
+                return;
+            } catch (org.springframework.web.client.HttpClientErrorException.Unauthorized e) {
+                tokenAdmin.invalidar();
+            } catch (Exception e) {
+                System.err.println("No se pudo consultar usuarios en Dominio 1: " + e.getMessage());
+                return;
+            }
+        }
+    }
+
+
+   
+    public DatosExternosService(SalonClient salonClient,
+                                UsuarioClient usuarioClient,
+                                TokenServicioAdmin tokenAdmin,
+                                @Value("${dominio1.url}") String urlDominio1) {
         this.salonClient = salonClient;
         this.usuarioClient = usuarioClient;
+        this.tokenAdmin = tokenAdmin;
+        this.dominio1 = RestClient.builder().baseUrl(urlDominio1).build();
+    }
+
+
+    private Object primero(Map<?, ?> m, String... claves) {
+        for (String k : claves) {
+            if (m.get(k) != null) return m.get(k);
+        }
+        return null;
     }
 
     public ReservacionDetalleResponseDTO enriquecerReservacion(ReservacionEntity r) {
@@ -58,8 +129,7 @@ public class DatosExternosService {
         Map<Integer, Map<Integer, String>> cacheMapaServicios = new HashMap<>();
         Map<Integer, Map<Integer, String>> cacheMapaInventario = new HashMap<>();
         Map<Integer, List<ServicioConfiguradoSalon>> cacheServiciosSalon = new HashMap<>();
-        Map<Integer, InfoClienteResuelta> cacheClientes = new HashMap<>();
-
+        
         List<ReservacionDetalleResponseDTO> resultado = new ArrayList<>(lista.size());
 
         for (ReservacionEntity r : lista) {
@@ -72,18 +142,17 @@ public class DatosExternosService {
             InfoSalonResuelta infoSalon = cacheInfoSalon.computeIfAbsent(
                     idSalon, k -> extraerInfoSalon(fuentesSalon, k)
             );
-            InfoClienteResuelta infoCliente = cacheClientes.computeIfAbsent(
-                    idUser, this::extraerInfoCliente
-            );
+            
             Map<Integer, String> mapaServicios = cacheMapaServicios.computeIfAbsent(
                     idSalon, k -> construirMapaServiciosSalon(fuentesSalon, catalogoGlobalServicios)
             );
             Map<Integer, String> mapaInventario = cacheMapaInventario.computeIfAbsent(
-                    idSalon, k -> extraerMapaInventarioLigero(fuentesSalon)
+                    idSalon, k -> cargarMapaInventarioSalon(k)
             );
             List<ServicioConfiguradoSalon> serviciosSalon = cacheServiciosSalon.computeIfAbsent(
                     idSalon, k -> extraerServiciosAsignadosSalonConCatalogo(fuentesSalon, mapaServicios)
             );
+            InfoClienteResuelta infoCliente = extraerInfoCliente(idUser);
 
             resultado.add(construirDetalleConCache(
                     r, infoSalon, infoCliente, mapaServicios, mapaInventario, serviciosSalon
@@ -96,18 +165,6 @@ public class DatosExternosService {
     private Map<Integer, Map<?, ?>> cargarMapaGlobalSalones() {
         Map<Integer, Map<?, ?>> mapa = new HashMap<>();
         Object respuesta = null;
-
-        try {
-            respuesta = salonClient.obtenerSalonesPublicados();
-        } catch (Exception ignored) {
-        }
-
-        if (respuesta == null) {
-            try {
-                respuesta = salonClient.obtenerTodosLosSalones();
-            } catch (Exception ignored) {
-            }
-        }
 
         List<?> lista = extraerListaDeRespuesta(respuesta);
         if (lista != null) {
@@ -141,19 +198,25 @@ public class DatosExternosService {
 
     private List<Object> obtenerFuentesSalonDesdeMapaGlobal(Integer idSalon, Map<Integer, Map<?, ?>> mapaGlobal) {
         List<Object> fuentes = new ArrayList<>();
+
+        Map<?, ?> propio = salonesPropietario.get(idSalon);
+        if (propio != null) {
+            fuentes.add(propio);
+            return fuentes;
+        }
+
         Map<?, ?> salonEnCache = mapaGlobal.get(idSalon);
         if (salonEnCache != null) {
             fuentes.add(salonEnCache);
             return fuentes;
         }
 
-        // Respaldo solo si el salón no estaba publicado (ej. en borrador o desactivado)
+        // Respaldo solo si el salón no estaba publicado
         try {
             Object det = salonClient.obtenerSalonDetalleCrudo(idSalon);
-            if (det != null) {
-                fuentes.add(det);
-            }
-        } catch (Exception ignored) {
+            if (det != null) fuentes.add(det);
+        } catch (Exception e) {
+            System.err.println("Fallo detalle salón " + idSalon + ": " + e.getMessage());
         }
         return fuentes;
     }
@@ -172,6 +235,11 @@ public class DatosExternosService {
 
     private List<Object> obtenerFuentesSalonRapido(Integer idSalon) {
         List<Object> fuentes = new ArrayList<>();
+        Map<?, ?> propio = salonesPropietario.get(idSalon);
+        if (propio != null) {
+            fuentes.add(propio);
+            return fuentes;
+        }
         try {
             Object det = salonClient.obtenerSalonDetalleCrudo(idSalon);
             if (det != null) {
@@ -396,126 +464,45 @@ public class DatosExternosService {
         return new InfoSalonResuelta(nombreSalon, ubicacion, precioHora, urlImagen);
     }
 
+
     public InfoClienteResuelta extraerInfoCliente(Integer idUser) {
-        try {
-            InfoClienteResuelta porId = mapearUsuario(usuarioClient.obtenerUsuarioPorId(idUser), idUser, false);
-            if (porId != null) return porId;
-        } catch (Exception ignored) {
+        InfoClienteResuelta desdeAdmin = buscarEnListaAdmin(idUser);
+        if (desdeAdmin != null) return desdeAdmin;
+        if (esUsuarioAutenticado(idUser)) {
+            try {
+                InfoClienteResuelta me = mapearUsuario(usuarioClient.obtenerUsuarioActualMe(), idUser);
+                if (me != null) return me;
+            } catch (Exception ignored) {}
         }
-        try {
-            InfoClienteResuelta me = mapearUsuario(usuarioClient.obtenerUsuarioActualMe(), idUser, true);
-            if (me != null) return me;
-        } catch (Exception ignored) {
-        }
-
-        try {
-            ServletRequestAttributes attrs = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-            if (attrs != null) {
-                String auth = attrs.getRequest().getHeader("Authorization");
-                if (auth != null && auth.startsWith("Bearer ")) {
-                    String[] partes = auth.substring(7).split("\\.");
-                    if (partes.length >= 2) {
-                        String payload = new String(Base64.getUrlDecoder().decode(partes[1]), StandardCharsets.UTF_8);
-                        Map<String, Object> claims = JsonParserFactory.getJsonParser().parseMap(payload);
-                        if (tokenPerteneceAUsuario(idUser, claims.get("sub") != null ? claims.get("sub").toString() : null)) {
-                            InfoClienteResuelta desdeClaims = mapearUsuario(claims, idUser, false);
-                            if (desdeClaims != null) return desdeClaims;
-                            if (claims.get("sub") != null && claims.get("sub").toString().contains("@")) {
-                                return new InfoClienteResuelta("Cliente #" + idUser, claims.get("sub").toString());
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception ignored) {
-        }
-
-        return new InfoClienteResuelta("Cliente #" + idUser, "No especificado");
+        return InfoClienteResuelta.desconocido(idUser);
     }
-
-    private InfoClienteResuelta mapearUsuario(Object resp, Integer idEsperado, boolean validarMismoId) {
+    private InfoClienteResuelta mapearUsuario(Object resp, Integer idEsperado) {
         if (!(resp instanceof Map<?, ?> m)) return null;
-        if (m.get("data") instanceof Map<?, ?> inner) m = inner;
-        else if (m.get("user") instanceof Map<?, ?> innerUser) m = innerUser;
-        else if (m.get("usuario") instanceof Map<?, ?> innerUsuario) m = innerUsuario;
 
-        Object nombres = m.get("nombres") != null ? m.get("nombres") : m.get("nombre");
-        Object apPat = m.get("apellidoPaterno") != null ? m.get("apellidoPaterno")
-                : (m.get("apellido_paterno") != null ? m.get("apellido_paterno") : m.get("apellido"));
-        Object apMat = m.get("apellidoMaterno") != null ? m.get("apellidoMaterno")
-                : (m.get("apellidoMat") != null ? m.get("apellidoMat") : m.get("apellido_materno"));
-        Object correo = m.get("gmail") != null ? m.get("gmail")
-                : (m.get("email") != null ? m.get("email") : m.get("correo"));
+        Object idResp = primero(m, "id_User", "id", "id_user");
+        if (idResp != null && idEsperado != null && !idResp.toString().equals(String.valueOf(idEsperado))) return null;
 
-        if (validarMismoId) {
-            Object idResp = m.get("id") != null ? m.get("id")
-                    : (m.get("id_user") != null ? m.get("id_user")
-                    : (m.get("idUser") != null ? m.get("idUser") : m.get("usuarioId")));
+        String nombre = String.join(" ",
+                texto(primero(m, "nombres", "nombre")),
+                texto(primero(m, "apellidoPaterno", "apellido_paterno")),
+                texto(primero(m, "apellidoMaterno", "apellido_materno"))).trim().replaceAll("\\s+", " ");
+        String correo = texto(primero(m, "gmail", "email", "correo"));
+        String telefono = texto(m.get("telefono"));
 
-            if (idResp != null) {
-                if (!idResp.toString().equals(String.valueOf(idEsperado))) {
-                    return null;
-                }
-            } else if (!tokenPerteneceAUsuario(idEsperado, correo != null ? correo.toString() : null)) {
-                return null;
-            }
-        }
-
-        StringBuilder full = new StringBuilder();
-        if (nombres != null && !nombres.toString().isBlank()) full.append(nombres.toString().trim());
-        if (apPat != null && !apPat.toString().isBlank()) full.append(" ").append(apPat.toString().trim());
-        if (apMat != null && !apMat.toString().isBlank()) full.append(" ").append(apMat.toString().trim());
-
-        if (full.isEmpty()) {
-            Object uName = m.get("nombreUser") != null ? m.get("nombreUser") : m.get("NombreUser");
-            if (uName != null && !uName.toString().isBlank()) full.append(uName.toString().trim());
-        }
-
-        if (full.isEmpty() && correo == null) return null;
+        if (nombre.isEmpty() && correo.isEmpty()) return null;
 
         return new InfoClienteResuelta(
-                !full.isEmpty() ? full.toString() : "Cliente #" + idEsperado,
-                correo != null ? correo.toString().trim() : "No especificado"
-        );
+                nombre.isEmpty() ? "Cliente #" + idEsperado : nombre,
+                correo.isEmpty() ? InfoClienteResuelta.NO_ESPECIFICADO : correo,
+                telefono.isEmpty() ? InfoClienteResuelta.NO_ESPECIFICADO : telefono);
     }
 
-    private boolean tokenPerteneceAUsuario(Integer idEsperado, String correoRespuesta) {
-        try {
-            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-            if (authentication != null && authentication.getPrincipal() != null) {
-                String principalId = authentication.getPrincipal().toString();
-                if (principalId.equals(String.valueOf(idEsperado))) {
-                    return true;
-                }
-            }
-        } catch (Exception ignored) {
-        }
+private String texto(Object o) { return o == null ? "" : o.toString().trim(); }
 
-        try {
-            ServletRequestAttributes attrs = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-            if (attrs == null) return false;
-            String auth = attrs.getRequest().getHeader("Authorization");
-            if (auth == null || !auth.startsWith("Bearer ")) return false;
-
-            String[] partes = auth.substring(7).split("\\.");
-            if (partes.length < 2) return false;
-
-            String payload = new String(Base64.getUrlDecoder().decode(partes[1]), StandardCharsets.UTF_8);
-            Map<String, Object> claims = JsonParserFactory.getJsonParser().parseMap(payload);
-
-            Object claimId = claims.get("id_user") != null ? claims.get("id_user")
-                    : (claims.get("idUser") != null ? claims.get("idUser") : claims.get("userId"));
-            if (claimId != null) {
-                return claimId.toString().equals(String.valueOf(idEsperado));
-            }
-
-            Object sub = claims.get("sub");
-            if (sub != null && correoRespuesta != null) {
-                return sub.toString().equalsIgnoreCase(correoRespuesta.trim());
-            }
-        } catch (Exception ignored) {
-        }
-        return false;
+    private boolean esUsuarioAutenticado(Integer idUser) {
+        Authentication a = SecurityContextHolder.getContext().getAuthentication();
+        return a != null && a.getPrincipal() != null
+                && a.getPrincipal().toString().equals(String.valueOf(idUser));
     }
 
     private Map<Integer, String> construirMapaServiciosSalon(List<Object> fuentesSalon, Map<Integer, String> catalogoGlobal) {
@@ -525,25 +512,7 @@ public class DatosExternosService {
                 List.of("nombreServicio", "NombreServicio", "nombre_servicio", "nombre"));
         return mapa;
     }
-    private Map<Integer, String> extraerMapaInventarioLigero(List<Object> fuentesSalon) {
-    Map<Integer, String> mapa = new HashMap<>();
-    List<String> keysId = List.of("idRecurso", "id_recurso", "id");
-    List<String> keysNombre = List.of("nombreRecurso", "nombre_recurso", "nombre");
-
-    for (Object fuente : fuentesSalon) {
-        if (fuente instanceof Map<?, ?> m) {
-            Object innerSalon = m.get("salon");
-            Map<?, ?> target = (innerSalon instanceof Map<?, ?> innerMap) ? innerMap : m;
-            Object invObj = target.get("inventario");
-            if (invObj != null) {
-                extraerParesRecursivo(invObj, mapa, keysId, keysNombre);
-                continue;
-            }
-        }
-        extraerParesRecursivo(fuente, mapa, keysId, keysNombre);
-    }
-    return mapa;
-}
+    
    
     private void extraerParesRecursivo(Object nodo, Map<Integer, String> mapa, List<String> clavesId, List<String> clavesNombre) {
         if (nodo instanceof List<?> lista) {
@@ -649,12 +618,12 @@ public class DatosExternosService {
                 BigDecimal precio = s.getPrecio_contratado() != null ? s.getPrecio_contratado() : BigDecimal.ZERO;
 
                 serviciosDto.add(ReservacionDetalleResponseDTO.ServicioItemDetalleDTO.builder()
-                        .idServicio(idServ)
-                        .nombreServicio(mapaServicios.getOrDefault(idServ, "Servicio #" + idServ))
-                        .cantidad(cant)
-                        .precioContratado(precio)
-                        .subtotal(precio.multiply(BigDecimal.valueOf(cant)))
-                        .build());
+                .idServicio(idServ)
+                .nombreServicio(mapaServicios.getOrDefault(idServ, "Servicio #" + idServ))
+                .cantidad(cant)
+                .precioContratado(precio)
+                .subtotal(precio.multiply(BigDecimal.valueOf(cant)))
+                .build());
             }
         } else {
             for (ServicioConfiguradoSalon sc : serviciosSalon) {
@@ -663,7 +632,7 @@ public class DatosExternosService {
                         .nombreServicio(sc.nombreServicio())
                         .cantidad(sc.cantidad())
                         .precioContratado(BigDecimal.ZERO)
-                        .subtotal(BigDecimal.ZERO)
+                        .subtotal(BigDecimal.ZERO)  
                         .build());
             }
         }
@@ -711,34 +680,59 @@ public class DatosExternosService {
         }
         BigDecimal saldoPendiente = costoTotal.subtract(totalPagado);
 
-        return ReservacionDetalleResponseDTO.builder()
-                .id_reservacion(r.getId_reservacion())
-                .fecha_inicio(r.getFecha_inicio())
-                .fecha_fin(r.getFecha_fin())
-                .hora_inicio(r.getHora_inicio())
-                .hora_fin(r.getHora_fin())
-                .estado_reservacion(r.getEstado_reservacion())
-                .costo_total(costoTotal)
-                .totalPagado(totalPagado)
-                .saldoPendiente(saldoPendiente)
-                .numero_invitados(r.getNumero_invitados())
-                .Usuariosid_user(r.getUsuariosid_user())
-                .nombreCliente(infoCliente.nombreCompleto())
-                .correoCliente(infoCliente.correo())
-                .Salonid_salon(r.getSalonid_salon())
-                .nombreSalon(infoSalon.nombreSalon())
-                .ubicacionSalon(infoSalon.ubicacion())
-                .precioHoraSalon(infoSalon.precioHora())
-                .token_qr(r.getToken_qr())
-                .check_in_realizado(r.getCheck_in_realizado())
-                .fecha_checkin(r.getFecha_checkin())
-                .servicios(serviciosDto)
-                .inventario(inventarioDto)
-                .pagos(r.getPagos())
-                .build();
+       return ReservacionDetalleResponseDTO.builder()
+        .id_reservacion(r.getId_reservacion())
+        .fecha_inicio(r.getFecha_inicio())
+        .fecha_fin(r.getFecha_fin())
+        .hora_inicio(r.getHora_inicio())
+        .hora_fin(r.getHora_fin())
+        .estado_reservacion(r.getEstado_reservacion())
+        .costo_total(costoTotal)
+        .totalPagado(totalPagado)
+        .saldoPendiente(saldoPendiente)
+        .numero_invitados(r.getNumero_invitados())
+        .Usuariosid_user(r.getUsuariosid_user())
+        .nombreCliente(infoCliente.nombreCompleto())
+        .correoCliente(infoCliente.correo())
+        .telefonoCliente(infoCliente.telefono())
+        .Salonid_salon(r.getSalonid_salon())
+        .nombreSalon(infoSalon.nombreSalon())
+        .ubicacionSalon(infoSalon.ubicacion())
+        .precioHoraSalon(infoSalon.precioHora())
+        .token_qr(r.getToken_qr())
+        .check_in_realizado(r.getCheck_in_realizado())
+        .fecha_checkin(r.getFecha_checkin())
+        .servicios(serviciosDto)
+        .inventario(inventarioDto)
+        .pagos(r.getPagos())
+        .build();
+    }
+
+    private Map<Integer, String> cargarMapaInventarioSalon(Integer idSalon) {
+        Map<Integer, String> mapa = new HashMap<>();
+        List<String> keysId = List.of("idRecurso", "id_recurso");
+        List<String> keysNombre = List.of("nombreRecurso", "nombre_recurso");
+
+        Map<?, ?> propio = salonesPropietario.get(idSalon);
+        if (propio != null && propio.get("inventario") != null) {
+            extraerParesRecursivo(propio.get("inventario"), mapa, keysId, keysNombre);
+        }
+        if (mapa.isEmpty()) {
+            try {
+                extraerParesRecursivo(salonClient.obtenerInventarioSalon(idSalon), mapa, keysId, keysNombre);
+            } catch (Exception e) {
+                System.err.println("Fallo inventario salón " + idSalon + ": " + e.getMessage());
+            }
+        }
+        return mapa;
     }
 
     public record ServicioConfiguradoSalon(Integer idServicio, String nombreServicio, Integer cantidad) {}
     public record InfoSalonResuelta(String nombreSalon, String ubicacion, BigDecimal precioHora, String urlImagen) {}
-    public record InfoClienteResuelta(String nombreCompleto, String correo) {}
+    public record InfoClienteResuelta(String nombreCompleto, String correo, String telefono) {
+    public static final String NO_ESPECIFICADO = "No especificado";
+    public static InfoClienteResuelta desconocido(Integer idUser) {
+        return new InfoClienteResuelta("Cliente #" + idUser, NO_ESPECIFICADO, NO_ESPECIFICADO);
+    }
+}
 }

@@ -15,6 +15,8 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
+import jakarta.annotation.PostConstruct;
+
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.List;
@@ -23,7 +25,7 @@ import java.util.Map;
 @Service
 public class PayPalService {
 
-    @Value("${paypal.client-id:}")
+     @Value("${paypal.client-id:}")
     private String clientId;
 
     @Value("${paypal.client-secret:}")
@@ -33,6 +35,14 @@ public class PayPalService {
     private String baseUrl;
 
     private final RestTemplate restTemplate = new RestTemplate();
+
+    @PostConstruct
+    void validarCredenciales() {
+        if (clientId.isBlank() || clientSecret.isBlank()) {
+            System.err.println("ADVERTENCIA: credenciales de PayPal vacías. Revisa el .env");
+        }
+    }
+
 
     // ==========================================
     // OBTENER TOKEN DE ACCESO PAYPAL

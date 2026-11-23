@@ -75,4 +75,12 @@ public class PropietarioReservacionController {
     public ResponseEntity<List<InventarioOcupadoDTO>> obtenerInventarioPorReservacion(@PathVariable Integer id) {
         return ResponseEntity.ok(reservacionService.obtenerInventarioOcupadoPorReservacion(id));
     }
+
+    //cambiar el estado de una reservacion
+    @PreAuthorize("hasAnyRole('VENDEDOR', 'PROPIETARIO')")
+    @PatchMapping("/{id}/revertir-cotizacion")
+    public ResponseEntity<ReservacionDetalleResponseDTO> revertirCotizacion(@PathVariable Integer id) {
+        ReservacionEntity revertida = reservacionService.revertirCotizacionASolicitudNueva(id);
+        return ResponseEntity.ok(datosExternosService.enriquecerReservacion(revertida));
+    }
 }
