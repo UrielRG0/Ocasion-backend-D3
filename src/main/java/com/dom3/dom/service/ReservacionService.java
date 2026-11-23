@@ -847,13 +847,13 @@ public class ReservacionService {
         // 5. Actualizar estado de la reservación y generar token_qr si aún no existe
         if (nuevoSaldo.compareTo(BigDecimal.ZERO) == 0) {
             r.setEstado_reservacion("CONFIRMADA");
+            if (r.getToken_qr() == null || r.getToken_qr().isBlank()) {
+                String sufijo = java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+                r.setToken_qr("OCASION-RES-" + r.getId_reservacion() + "-" + sufijo);
+            }
         } else {
             r.setEstado_reservacion("ANTICIPO_PAGADO");
-        }
-
-        if (r.getToken_qr() == null || r.getToken_qr().isBlank()) {
-            String sufijo = java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-            r.setToken_qr("OCASION-RES-" + r.getId_reservacion() + "-" + sufijo);
+            r.setToken_qr(null);
         }
 
         ReservacionEntity guardada = reservacionRepository.save(r);
